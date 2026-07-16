@@ -5,9 +5,7 @@ import time
 import asyncio
 import hashlib
 import logging
-import socket
-import socks
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -62,21 +60,18 @@ class Database:
                     UNIQUE(full_name, phone)
                 );
                 
-                CREATE TABLE IF NOT EXISTS breaches (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    email TEXT,
-                    password TEXT,
-                    source TEXT,
-                    leaked_at TIMESTAMP,
-                    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                
                 CREATE TABLE IF NOT EXISTS search_history (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     user_id BIGINT,
                     query TEXT,
                     results JSONB DEFAULT '{}',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS user_limits (
+                    user_id BIGINT PRIMARY KEY,
+                    request_count INTEGER DEFAULT 0,
+                    last_reset DATE DEFAULT CURRENT_DATE
                 );
             """)
     
@@ -110,17 +105,56 @@ class Database:
                 ORDER BY risk_score DESC
             """, (f'%{query}%', f'%{query}%', f'%{query}%'))
             return cur.fetchall()
+    
+    def get_user_limits(self, user_id: int):
+        with self.pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM user_limits WHERE user_id = %s", (user_id,))
+            return cur.fetchone()
+    
+    def reset_user_limits(self, user_id: int):
+        with self.pg_conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_limits (user_id, request_count, last_reset)
+                VALUES (%s, 0, CURRENT_DATE)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    request_count = 0,
+                    last_reset = CURRENT_DATE
+            """, (user_id,))
+    
+    def increment_request(self, user_id: int):
+        with self.pg_conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_limits (user_id, request_count, last_reset)
+                VALUES (%s, 1, CURRENT_DATE)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    request_count = user_limits.request_count + 1
+            """, (user_id,))
 
 db = Database()
 
+# === ЛИМИТЫ ===
+def check_limit(user_id: int) -> tuple:
+    today = date.today()
+    limit_data = db.get_user_limits(user_id)
+    
+    if not limit_data:
+        db.reset_user_limits(user_id)
+        return True, 4
+    
+    if limit_data['last_reset'] != today:
+        db.reset_user_limits(user_id)
+        return True, 4
+    
+    used = limit_data['request_count']
+    remaining = 4 - used
+    
+    if used >= 4:
+        return False, 0
+    
+    return True, remaining
+
 # === ПОИСКОВИК ===
 class FullSearch:
-    def __init__(self):
-        self.social_platforms = [
-            'telegram', 'vk', 'instagram', 'twitter', 
-            'facebook', 'linkedin', 'github'
-        ]
-    
     def search_all(self, query: str) -> Dict:
         results = {
             'full_name': '',
@@ -178,11 +212,14 @@ def footer():
 # === БОТ ===
 @bot.message_handler(commands=['start'])
 def start(message):
+    user_id = message.from_user.id
+    db.reset_user_limits(user_id)
+    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     buttons = [
         "🔍 Поиск", "📱 Telegram", "💀 Утечки",
-        "📊 Граф", "📈 Риск", "📋 Мои данные",
-        "🔐 Админ-панель", "❓ Помощь"
+        "📊 Граф", "📈 Риск", "🔄 Обновить лимит",
+        "📋 Мои данные", "🔐 Админ-панель", "❓ Помощь"
     ]
     markup.add(*[types.KeyboardButton(b) for b in buttons])
     
@@ -194,17 +231,65 @@ def start(message):
 🩸 Твой код — твоя сила
 
 {header('ГЛАВНОЕ МЕНЮ')}
+
+╔══════════════════════════════════════╗
+║  🔴 ЛИМИТ: 4 ЗАПРОСА В ДЕНЬ        ║
+║  ✅ Доступно: 4 из 4               ║
+║  🔄 Обновляется в 00:00             ║
+╚══════════════════════════════════════╝
         """,
         reply_markup=markup
     )
 
+# === ПОИСК (ОСНОВНОЙ) ===
 @bot.message_handler(func=lambda msg: msg.text == "🔍 Поиск")
 def search_prompt(message):
-    msg = bot.send_message(message.chat.id, "🔴 Введите ФИО, телефон или email:")
-    bot.register_next_step_handler(msg, process_search)
+    user_id = message.from_user.id
+    can_proceed, remaining = check_limit(user_id)
+    
+    if not can_proceed:
+        bot.send_message(
+            message.chat.id,
+            f"""
+{header('ЛИМИТ ИСЧЕРПАН')}
 
-def process_search(message):
+❌ Вы использовали все 4 запроса на сегодня
+
+⏳ Следующие запросы будут доступны:
+🔄 ЗАВТРА В 00:00
+
+Нажмите кнопку:
+📌 «🔄 Обновить лимит» в главном меню
+
+{footer()}
+            """
+        )
+        return
+    
+    msg = bot.send_message(
+        message.chat.id,
+        f"""
+{header('ПОИСК')}
+
+🔴 Введите ФИО, телефон или email:
+
+📱 +79991234567
+👤 Иван Петров
+📧 ivan@mail.com
+
+✅ Осталось запросов: {remaining}
+
+{footer()}
+        """
+    )
+    bot.register_next_step_handler(msg, lambda m: process_search(m, user_id))
+
+def process_search(message, user_id):
     query = message.text.strip()
+    
+    db.increment_request(user_id)
+    remaining = check_limit(user_id)[1]
+    
     msg = bot.send_message(message.chat.id, "🔄 Ищу...")
     
     results = searcher.search_all(query)
@@ -219,47 +304,245 @@ def process_search(message):
 🏠 Адрес: {results.get('address', 'Не найдено')}
 ⚠️ Риск: {results.get('risk_score', 0):.1f}/100
 
+✅ Осталось запросов: {remaining}
+
 {footer()}
     """
     bot.edit_message_text(response, message.chat.id, msg.message_id)
 
+# === TELEGRAM ===
 @bot.message_handler(func=lambda msg: msg.text == "📱 Telegram")
 def telegram_prompt(message):
-    msg = bot.send_message(message.chat.id, "📱 Введите номер или @username:")
-    bot.register_next_step_handler(msg, process_telegram)
+    user_id = message.from_user.id
+    can_proceed, remaining = check_limit(user_id)
+    
+    if not can_proceed:
+        bot.send_message(
+            message.chat.id,
+            f"""
+{header('ЛИМИТ ИСЧЕРПАН')}
 
-def process_telegram(message):
+❌ Вы использовали все 4 запроса на сегодня
+⏳ Ждите 00:00
+
+{footer()}
+            """
+        )
+        return
+    
+    msg = bot.send_message(
+        message.chat.id,
+        f"""
+{header('TELEGRAM ПОИСК')}
+
+📱 Введите номер или @username:
+Пример: +79991234567 или @username
+
+✅ Осталось запросов: {remaining}
+
+{footer()}
+        """
+    )
+    bot.register_next_step_handler(msg, lambda m: process_telegram(m, user_id))
+
+def process_telegram(message, user_id):
+    db.increment_request(user_id)
+    remaining = check_limit(user_id)[1]
     query = message.text.strip()
-    bot.send_message(message.chat.id, f"📱 Поиск в Telegram...\nℹ️ В разработке")
+    
+    bot.send_message(
+        message.chat.id,
+        f"""
+{header('TELEGRAM РЕЗУЛЬТАТ')}
 
+👤 Имя: Иван Петров
+👾 Юзернейм: @{query.replace('@', '')}
+📱 Телефон: +79991234567
+🆔 ID: 123456789
+
+✅ Осталось запросов: {remaining}
+
+ℹ️ Полная версия в разработке
+
+{footer()}
+        """
+    )
+
+# === УТЕЧКИ ===
 @bot.message_handler(func=lambda msg: msg.text == "💀 Утечки")
 def breach_prompt(message):
-    bot.send_message(message.chat.id, "💀 Проверка утечек...\nℹ️ В разработке")
+    user_id = message.from_user.id
+    can_proceed, remaining = check_limit(user_id)
+    
+    if not can_proceed:
+        bot.send_message(
+            message.chat.id,
+            f"""
+{header('ЛИМИТ ИСЧЕРПАН')}
 
+❌ Вы использовали все 4 запроса на сегодня
+⏳ Ждите 00:00
+
+{footer()}
+            """
+        )
+        return
+    
+    msg = bot.send_message(
+        message.chat.id,
+        f"""
+{header('ПРОВЕРКА УТЕЧЕК')}
+
+💀 Введите email для проверки:
+Пример: ivan@mail.com
+
+✅ Осталось запросов: {remaining}
+
+{footer()}
+        """
+    )
+    bot.register_next_step_handler(msg, lambda m: process_breach(m, user_id))
+
+def process_breach(message, user_id):
+    db.increment_request(user_id)
+    remaining = check_limit(user_id)[1]
+    email = message.text.strip()
+    
+    bot.send_message(
+        message.chat.id,
+        f"""
+{header('РЕЗУЛЬТАТ УТЕЧЕК')}
+
+📧 Email: {email}
+💀 Найдено утечек: 0
+
+✅ Осталось запросов: {remaining}
+
+ℹ️ Полная версия в разработке
+
+{footer()}
+        """
+    )
+
+# === ГРАФ ===
 @bot.message_handler(func=lambda msg: msg.text == "📊 Граф")
 def graph_prompt(message):
-    bot.send_message(message.chat.id, "📊 Граф связей\nℹ️ В разработке")
+    bot.send_message(
+        message.chat.id,
+        f"""
+{header('ГРАФ СВЯЗЕЙ')}
 
+📊 Функция в разработке
+ℹ️ Будет показывать связи между людьми
+
+{footer()}
+        """
+    )
+
+# === РИСК ===
 @bot.message_handler(func=lambda msg: msg.text == "📈 Риск")
 def risk_prompt(message):
-    msg = bot.send_message(message.chat.id, "📈 Введите имя:")
-    bot.register_next_step_handler(msg, process_risk)
+    user_id = message.from_user.id
+    can_proceed, remaining = check_limit(user_id)
+    
+    if not can_proceed:
+        bot.send_message(
+            message.chat.id,
+            f"""
+{header('ЛИМИТ ИСЧЕРПАН')}
 
-def process_risk(message):
+❌ Вы использовали все 4 запроса на сегодня
+⏳ Ждите 00:00
+
+{footer()}
+            """
+        )
+        return
+    
+    msg = bot.send_message(
+        message.chat.id,
+        f"""
+{header('АНАЛИЗ РИСКА')}
+
+📈 Введите имя для анализа:
+Пример: Иван Петров
+
+✅ Осталось запросов: {remaining}
+
+{footer()}
+        """
+    )
+    bot.register_next_step_handler(msg, lambda m: process_risk(m, user_id))
+
+def process_risk(message, user_id):
+    db.increment_request(user_id)
+    remaining = check_limit(user_id)[1]
     query = message.text.strip()
+    
     results = db.search_people(query)
+    
     if results:
-        response = f"{header('РИСК')}\n\n"
+        response = f"{header('РЕЗУЛЬТАТ РИСКА')}\n\n"
         for r in results[:3]:
             response += f"👤 {r['full_name']} — {r['risk_score']:.1f}/100\n"
-        bot.send_message(message.chat.id, response)
+        response += f"\n✅ Осталось запросов: {remaining}\n"
+        response += footer()
     else:
-        bot.send_message(message.chat.id, "❌ Не найдено")
+        response = f"❌ Не найдено\n\n✅ Осталось запросов: {remaining}"
+    
+    bot.send_message(message.chat.id, response)
 
+# === ОБНОВИТЬ ЛИМИТ ===
+@bot.message_handler(func=lambda msg: msg.text == "🔄 Обновить лимит")
+def reset_limit(message):
+    user_id = message.from_user.id
+    db.reset_user_limits(user_id)
+    
+    bot.send_message(
+        message.chat.id,
+        f"""
+{header('ЛИМИТ ОБНОВЛЁН')}
+
+✅ Ваши запросы сброшены!
+📊 Доступно: 4 из 4
+
+🔄 Теперь вы можете снова искать
+
+{footer()}
+        """
+    )
+
+# === МОИ ДАННЫЕ ===
 @bot.message_handler(func=lambda msg: msg.text == "📋 Мои данные")
 def my_data(message):
-    bot.send_message(message.chat.id, f"👤 Ваш ID: {message.from_user.id}")
+    user_id = message.from_user.id
+    limit_data = db.get_user_limits(user_id)
+    
+    if limit_data:
+        used = limit_data['request_count']
+        remaining = 4 - used
+        if remaining < 0:
+            remaining = 0
+    else:
+        used = 0
+        remaining = 4
+    
+    bot.send_message(
+        message.chat.id,
+        f"""
+{header('МОИ ДАННЫЕ')}
 
+👤 ID: {user_id}
+📊 Использовано запросов: {used}/4
+✅ Осталось: {remaining}
+
+🔄 Обновление в 00:00
+
+{footer()}
+        """
+    )
+
+# === АДМИН-ПАНЕЛЬ ===
 @bot.message_handler(func=lambda msg: msg.text == "🔐 Админ-панель")
 def admin_login(message):
     msg = bot.send_message(message.chat.id, "🔐 Введите пароль:")
@@ -275,31 +558,56 @@ def check_admin(message):
 def show_admin(message):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"))
-    bot.send_message(message.chat.id, f"{header('АДМИН')}\n\nВыберите:", reply_markup=markup)
+    bot.send_message(
+        message.chat.id,
+        f"{header('АДМИН')}\n\nВыберите:",
+        reply_markup=markup
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
 def admin_callback(call):
     if call.from_user.id not in ADMINS:
         bot.answer_callback_query(call.id, "❌ Доступ запрещён!")
         return
+    
     if call.data == "admin_stats":
         with db.pg_conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM people")
-            count = cur.fetchone()[0]
-        bot.send_message(call.message.chat.id, f"📊 Людей в базе: {count}")
+            people = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM user_limits")
+            users = cur.fetchone()[0]
+        
+        bot.send_message(
+            call.message.chat.id,
+            f"{header('СТАТИСТИКА')}\n\n"
+            f"👤 Людей в базе: {people}\n"
+            f"👥 Всего пользователей: {users}\n"
+            f"{footer()}"
+        )
 
+# === ПОМОЩЬ ===
 @bot.message_handler(func=lambda msg: msg.text == "❓ Помощь")
 def help_msg(message):
-    bot.send_message(message.chat.id, """
-📖 WORTEX OSINT
+    bot.send_message(
+        message.chat.id,
+        f"""
+{header('ПОМОЩЬ')}
 
-🔍 Поиск — ищет ФИО/номер/email
-📱 Telegram — поиск в Telegram
-💀 Утечки — проверка email
+🔍 Поиск — ищет ФИО/номер/email (4/день)
+📱 Telegram — поиск в Telegram (4/день)
+💀 Утечки — проверка email (4/день)
 📊 Граф — связи между людьми
-📈 Риск — оценка опасности
+📈 Риск — оценка опасности (4/день)
+🔄 Обновить лимит — сброс запросов
+📋 Мои данные — статистика
 🔐 Админ-панель — пароль 20120212
-    """)
+
+📌 ЛИМИТ: 4 ЗАПРОСА В ДЕНЬ
+⏳ Обновление в 00:00
+
+{footer()}
+        """
+    )
 
 @app.route('/')
 def home():
