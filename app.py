@@ -13,11 +13,9 @@ from flask import Flask
 # === КОНФИГ ===
 TOKEN = os.environ.get("TOKEN", "8983546242:AAHVHOfgflOeR4uZoZlbsmdVvjUIF-oiWbQ")
 ADMIN_PASSWORD = "20120212"
-DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# === ПРОВЕРКА: БЕЗ БАЗЫ НЕ ЗАПУСКАЕМСЯ ===
-if not DATABASE_URL:
-    raise Exception("postgresql://osint_db_gizl_user:lPeFFhrhAtq5DTPE27tBO8mbDnVQe53u@dpg-d9c6ruurnols73dtmk6g-a/osint_db_gizl")
+# === ПРЯМОЕ ПОДКЛЮЧЕНИЕ К БАЗЕ ===
+DATABASE_URL = "postgresql://osint_db_gizl_user:lPeFFhrhAtq5DTPE27tBO8mbDnVQe53u@dpg-d9c6ruurnols73dtmk6g-a/osint_db_gizl"
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
@@ -26,13 +24,18 @@ logger = logging.getLogger(__name__)
 
 ADMINS = []
 
-# === ПРОСТАЯ БАЗА БЕЗ REDIS ===
+# === БАЗА ДАННЫХ ===
 class SimpleDB:
     def __init__(self):
-        self.conn = psycopg2.connect(DATABASE_URL)
-        self.conn.autocommit = True
-        self.init_tables()
-        logger.info("✅ PostgreSQL подключена")
+        try:
+            self.conn = psycopg2.connect(DATABASE_URL)
+            self.conn.autocommit = True
+            self.init_tables()
+            logger.info("✅ PostgreSQL подключена")
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения: {e}")
+            self.conn = None
+            raise
     
     def init_tables(self):
         with self.conn.cursor() as cur:
