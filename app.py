@@ -35,9 +35,10 @@ logger = logging.getLogger(__name__)
 
 ADMINS = []
 
-# === БАЗА ДАННЫХ ===
+# === БАЗА ДАННЫХ (ПРАВИЛЬНОЕ ПОДКЛЮЧЕНИЕ) ===
 class Database:
     def __init__(self):
+        # ПОДКЛЮЧЕНИЕ ЧЕРЕЗ ПЕРЕМЕННУЮ
         self.pg_conn = psycopg2.connect(DATABASE_URL)
         self.pg_conn.autocommit = True
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
