@@ -1,8 +1,10 @@
 pyTelegramBotAPI
-Flask
 psycopg2-binary
-gunicorn
+redis
+requests
 beautifulsoup4
 lxml
-requests
-redis
+aiohttp
+telethon
+Flask
+gunicorn
