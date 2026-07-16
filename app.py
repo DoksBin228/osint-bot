@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, request
 
-TOKEN = os.environ.get("TOKEN", "8983546242:AAHVHOfgflOeR4uZoZlbsmdVvjUIF-oiWbQ")
+TOKEN = "8649959843:AAHLiZoKCU1vlKtLPyA2zbORqv0AmDc71_k"
 ADMIN_PASSWORD = "20120212"
 DATABASE_URL = "postgresql://osint_db_gizl_user:lPeFFhrhAtq5DTPE27tBO8mbDnVQe53u@dpg-d9c6ruurnols73dtmk6g-a/osint_db_gizl"
 
