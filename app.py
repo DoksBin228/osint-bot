@@ -17,7 +17,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # === ПРОВЕРКА: БЕЗ БАЗЫ НЕ ЗАПУСКАЕМСЯ ===
 if not DATABASE_URL:
-    raise Exception("❌ DATABASE_URL не задан! Добавь переменную в Render.")
+    raise Exception("postgresql://osint_db_gizl_user:lPeFFhrhAtq5DTPE27tBO8mbDnVQe53u@dpg-d9c6ruurnols73dtmk6g-a/osint_db_gizl")
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
